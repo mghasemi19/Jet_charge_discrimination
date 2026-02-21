@@ -39,10 +39,6 @@ X_test = scaler.transform(X_test)
 X_train = np.nan_to_num(X_train)
 X_test = np.nan_to_num(X_test)
 
-print(type(X))
-print(type(X_train))
-print(X_train.shape)
-
 # GPU-ready training template for the PlainParticleTransformer (no interaction embedding)
 # - Moves model + batches to CUDA (if available)
 # - Verbose logs: batch loss (optional), epoch loss, accuracy, AUC
@@ -351,6 +347,36 @@ def simple_split_indices(n, val_frac=0.2, seed=123):
     trn_idx = perm[n_val:]
     return trn_idx, val_idx
 
+def stratified_split_indices(y, val_frac=0.2, seed=123):
+    """
+    y: torch tensor (N,) or numpy array (N,) with class labels 0/1
+    returns: train_idx, val_idx as torch.LongTensor
+    """
+    if isinstance(y, np.ndarray):
+        y = torch.from_numpy(y)
+    y = y.long()
+
+    g = torch.Generator().manual_seed(seed)
+
+    idx0 = torch.where(y == 0)[0]
+    idx1 = torch.where(y == 1)[0]
+
+    # shuffle within each class
+    idx0 = idx0[torch.randperm(idx0.numel(), generator=g)]
+    idx1 = idx1[torch.randperm(idx1.numel(), generator=g)]
+
+    n0_val = max(1, int(idx0.numel() * val_frac))
+    n1_val = max(1, int(idx1.numel() * val_frac))
+
+    val_idx = torch.cat([idx0[:n0_val], idx1[:n1_val]])
+    trn_idx = torch.cat([idx0[n0_val:], idx1[n1_val:]])
+
+    # shuffle final indices
+    val_idx = val_idx[torch.randperm(val_idx.numel(), generator=g)]
+    trn_idx = trn_idx[torch.randperm(trn_idx.numel(), generator=g)]
+
+    return trn_idx, val_idx
+
 # ----------------------------
 # 3) Metrics helpers
 # ----------------------------
@@ -405,9 +431,33 @@ def evaluate(model, loader, device):
     all_probs = torch.cat(all_probs)
     all_y = torch.cat(all_y)
     avg_loss = total_loss / max(total_n, 1)
-    acc = accuracy_from_logits(torch.stack([1-all_probs, all_probs], dim=1), all_y)
+    #acc = accuracy_from_logits(torch.stack([1-all_probs, all_probs], dim=1), all_y)
+    # compute acc from logits for correctness
+    # easiest: store logits too, or recompute via threshold:
+    pred = (all_probs >= 0.5).long()
+    acc = (pred == all_y).float().mean().item()
     auc = auc_binary_from_probs(all_probs, all_y)
     return avg_loss, acc, auc
+
+import torch
+import numpy as np
+import matplotlib.pyplot as plt
+
+@torch.no_grad()
+def collect_probs_labels(model, loader, device):
+    model.eval()
+    probs_all = []
+    y_all = []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = model(x)
+        probs = torch.softmax(logits, dim=1)[:, 1]  # P(class=1)
+        probs_all.append(probs.detach().cpu())
+        y_all.append(y.detach().cpu())
+    probs_all = torch.cat(probs_all).numpy()
+    y_all = torch.cat(y_all).numpy().astype(np.int64)
+    return probs_all, y_all
 
 # ----------------------------
 # 4) Training loop with CUDA + verbose
@@ -429,7 +479,17 @@ def train_model(
     print(f"Device: {device} | CUDA available: {torch.cuda.is_available()}")
 
     ds = TabJets(X, Y)
-    trn_idx, val_idx = simple_split_indices(len(ds), val_frac=val_frac, seed=seed)
+    #trn_idx, val_idx = simple_split_indices(len(ds), val_frac=val_frac, seed=seed)
+
+    # stratified split to guarantee both classes exist in val
+    trn_idx, val_idx = stratified_split_indices(ds.y, val_frac=val_frac, seed=seed)
+
+    # sanity prints
+    y_trn = ds.y[trn_idx]
+    y_val = ds.y[val_idx]
+    print("Train class counts:", torch.bincount(y_trn))
+    print("Val   class counts:", torch.bincount(y_val))
+
     trn_ds = torch.utils.data.Subset(ds, trn_idx.tolist())
     val_ds = torch.utils.data.Subset(ds, val_idx.tolist())
 
@@ -459,6 +519,14 @@ def train_model(
     scaler = torch.cuda.amp.GradScaler(enabled=(use_amp and device.type == "cuda"))
 
     best_val_auc = -1.0
+    history = {
+    "train_loss": [],
+    "val_loss": [],
+    "train_acc": [],
+    "val_acc": [],
+    "val_auc": [],
+    }
+
     for epoch in range(1, epochs + 1):
         model.train()
         t0 = time.time()
@@ -491,6 +559,23 @@ def train_model(
                       f"loss {avg:.4f} | batch_acc {acc_b:.3f}")
 
         trn_loss = running / max(n_seen, 1)
+        # Compute train accuracy at end of epoch
+        model.eval()
+        with torch.no_grad():
+            all_probs_tr = []
+            all_y_tr = []
+            for x_tr, y_tr in loader_trn:
+                x_tr = x_tr.to(device)
+                y_tr = y_tr.to(device)
+                logits_tr = model(x_tr)
+                probs_tr = torch.softmax(logits_tr, dim=1)[:, 1]
+                all_probs_tr.append(probs_tr)
+                all_y_tr.append(y_tr)
+
+            all_probs_tr = torch.cat(all_probs_tr)
+            all_y_tr = torch.cat(all_y_tr)
+            train_acc = ((all_probs_tr >= 0.5).long() == all_y_tr).float().mean().item()
+
         val_loss, val_acc, val_auc = evaluate(model, loader_val, device)
         dt = time.time() - t0
 
@@ -498,6 +583,13 @@ def train_model(
         if improved:
             best_val_auc = val_auc
             best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        # Store metrics
+        history["train_loss"].append(trn_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+        history["val_auc"].append(val_auc)
 
         print(f"[Epoch {epoch:03d}] time {dt:.1f}s | "
               f"train_loss {trn_loss:.4f} | val_loss {val_loss:.4f} | "
@@ -508,6 +600,23 @@ def train_model(
     model.load_state_dict(best_state)
     model.to(device)
     print(f"Best val AUC: {best_val_auc:.4f}")
-    return model, device
+    return model, device, history
 
-model, device = train_model(X, Y, epochs=1, batch_size=512, log_every=25, use_amp=True)
+# ----------------------------
+# 5) Example call
+# ----------------------------
+def main():
+    model, device, history = train_model(
+        X, Y,
+        epochs=100,
+        batch_size=512,
+        log_every=25,
+        use_amp=True,
+        num_workers=0,   # now you can use >0 safely
+    )
+    return model, device, history
+
+if __name__ == "__main__":
+    import torch.multiprocessing as mp
+    mp.freeze_support()   # important on Windows
+    model, device, history = main()
